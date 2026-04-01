@@ -164,6 +164,9 @@ const httpServer = http.createServer(async (req, res) => {
     const token = authHeader.replace("Bearer ", "");
     const usuario = verificarToken(token);
 
+    console.log(`[AUTH] token recibido: "${token.substring(0, 20)}..."`);
+    console.log(`[AUTH] usuario verificado: ${usuario}`);
+
     if (!usuario) {
       res.writeHead(401, {
         "Content-Type": "application/json",
@@ -212,6 +215,11 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 const PORT = parseInt(process.env.PORT || "3000");
+
+console.log(`[CONFIG] JWT_SECRET presente: ${!!process.env.JWT_SECRET}`);
+console.log(`[CONFIG] BASE_URL: ${process.env.BASE_URL}`);
+console.log(`[CONFIG] PATH_URL: ${process.env.PATH_URL}`);
+
 httpServer.listen(PORT, "0.0.0.0", () => {
   console.log(`MCP corriendo en http://0.0.0.0:${PORT}`);
 });
