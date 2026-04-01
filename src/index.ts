@@ -1,8 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import sql from "mssql";
 import * as dotenv from "dotenv";
-import { z } from "zod";
 import * as http from "http";
 import { readFileSync } from "fs";
 import { resolve, dirname } from "path";
@@ -16,6 +14,8 @@ import {
   generarToken,
   verificarToken,
 } from "./auth.js";
+import { obtenerModulosUsuario } from "./permisos.js";
+import { registrarModuloAsistencia, type AsistenciaConfig } from "./modules/asistencia.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -27,29 +27,20 @@ dotenv.config();
 const config = JSON.parse(
   readFileSync(resolve(__dirname, "..", "config.json"), "utf-8")
 );
-const PROYECTOS: Record<string, string[]> = config.proyectos;
-const SCHEMA_BASE: string = config.schema_description;
 
-const SCHEMA_DESCRIPTION = `${SCHEMA_BASE}
-
-== MAPEO DISPOSITIVOS → PROYECTO ==
-Los dispositivos (relojes) se agrupan por proyecto. Este mapeo NO está en la DB:
-${Object.entries(PROYECTOS).map(([k, v]) => `  ${k}: ${v.length ? v.join(", ") : "(sin dispositivos)"}`).join("\n")}`;
-
-// --- DB ----------------------------------------------------------------------
-
-const dbConfig: sql.config = {
-  server: process.env.MSSQL_HOST!,
-  port: parseInt(process.env.MSSQL_PORT || "1433"),
-  database: process.env.MSSQL_DATABASE!,
-  user: process.env.MSSQL_USER!,
-  password: process.env.MSSQL_PASSWORD!,
-  options: { trustServerCertificate: true },
+const asistenciaConfig: AsistenciaConfig = {
+  proyectos: config.proyectos,
+  schema_description: config.schema_description,
 };
 
-async function getPool() {
-  return sql.connect(dbConfig);
-}
+// --- Módulos -----------------------------------------------------------------
+// Para agregar un módulo nuevo: crear src/modules/xxx.ts e importarlo acá.
+
+const MODULOS: Record<string, (server: McpServer, usuario: string) => void> = {
+  asistencia: (server, usuario) => registrarModuloAsistencia(server, usuario, asistenciaConfig),
+};
+
+const MSG_NO_AUTORIZADO = "No tenés permisos asignados para usar estas herramientas. Contactá al administrador si creés que deberías tener acceso.";
 
 // --- Helpers -----------------------------------------------------------------
 
@@ -66,51 +57,6 @@ function json(res: http.ServerResponse, status: number, data: unknown) {
   res.end(JSON.stringify(data));
 }
 
-// --- Tools -------------------------------------------------------------------
-
-function registrarTools(server: McpServer, usuario: string) {
-  server.tool(
-    "listar_proyectos",
-    "Lista todos los proyectos de la empresa con sus dispositivos (relojes) asociados.",
-    {},
-    async () => ({
-      content: [{ type: "text", text: JSON.stringify(PROYECTOS, null, 2) }],
-    })
-  );
-
-  server.tool(
-    "consulta_sql",
-    `Ejecuta una consulta SELECT de solo lectura contra la base de datos de asistencia.
-Usá esta herramienta para responder cualquier pregunta sobre asistencia, presentes, ausentes, empleados, etc.
-
-${SCHEMA_DESCRIPTION}`,
-    { query: z.string().describe("Consulta SQL SELECT a ejecutar. Solo se permiten SELECT.") },
-    async ({ query }) => {
-      const trimmed = query.trim();
-      if (!/^SELECT\b/i.test(trimmed)) {
-        return { content: [{ type: "text", text: "Error: Solo se permiten consultas SELECT." }], isError: true };
-      }
-      if (/\b(INSERT|UPDATE|DELETE|DROP|ALTER|CREATE|TRUNCATE|EXEC|EXECUTE|MERGE|GRANT|REVOKE|DENY)\b/i.test(trimmed)) {
-        return { content: [{ type: "text", text: "Error: La consulta contiene operaciones no permitidas." }], isError: true };
-      }
-
-      console.log(`[SQL] ${usuario} → ${trimmed}`);
-
-      const pool = await getPool();
-      try {
-        const result = await pool.request().query(trimmed);
-        await pool.close();
-        return {
-          content: [{ type: "text", text: JSON.stringify({ filas: result.recordset.length, datos: result.recordset }) }],
-        };
-      } catch (err: any) {
-        await pool.close();
-        return { content: [{ type: "text", text: `Error SQL: ${err.message}` }], isError: true };
-      }
-    }
-  );
-}
-
 // --- HTTP Server -------------------------------------------------------------
 
 const httpServer = http.createServer(async (req, res) => {
@@ -119,7 +65,7 @@ const httpServer = http.createServer(async (req, res) => {
 
   console.log(`[HTTP] ${method} ${url.pathname} (auth: ${req.headers["authorization"] ? "present" : "none"})`);
 
-  // 1. Protected Resource Metadata — Claude lo llama primero ante un 401
+  // 1. Protected Resource Metadata
   if (url.pathname === "/.well-known/oauth-protected-resource") {
     return json(res, 200, {
       resource: process.env.BASE_URL,
@@ -128,7 +74,7 @@ const httpServer = http.createServer(async (req, res) => {
     });
   }
 
-  // 2. Authorization Server Metadata — Claude descubre los endpoints
+  // 2. Authorization Server Metadata
   if (url.pathname === "/.well-known/oauth-authorization-server") {
     return json(res, 200, {
       issuer: process.env.BASE_URL,
@@ -141,7 +87,7 @@ const httpServer = http.createServer(async (req, res) => {
     });
   }
 
-  // 3. Dynamic Client Registration — Claude se registra acá
+  // 3. Dynamic Client Registration
   if (url.pathname === "/oauth/register" && method === "POST") {
     const raw = await leerBody(req);
     const body = JSON.parse(raw);
@@ -150,18 +96,17 @@ const httpServer = http.createServer(async (req, res) => {
     return json(res, 201, client);
   }
 
-  // 4. Authorize — Claude redirige al usuario acá, vos redirigís a Azure
+  // 4. Authorize
   if (url.pathname === "/oauth/authorize" && method === "GET") {
     const redirectUri = url.searchParams.get("redirect_uri") ?? "";
     const clientState = url.searchParams.get("state") ?? "";
     const clientCodeChallenge = url.searchParams.get("code_challenge") ?? "";
-    console.log(`[OAuth] Authorize: redirect_uri=${redirectUri}, code_challenge=${clientCodeChallenge ? "present" : "MISSING"}`);
     const { location } = await generarUrlAzure(redirectUri, clientState, clientCodeChallenge);
     res.writeHead(302, { Location: location });
     return res.end();
   }
 
-  // 5. Callback de Azure — Azure redirige acá después del login
+  // 5. Callback de Azure
   if (url.pathname === "/oauth/callback" && method === "GET") {
     const code = url.searchParams.get("code") ?? "";
     const azureState = url.searchParams.get("state") ?? "";
@@ -173,7 +118,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     const authCode = generarAuthCode(result.email, result.codeChallenge);
-    console.log(`[OAuth] Login exitoso: ${result.email}, code_challenge guardado: ${result.codeChallenge ? "sí" : "NO"}`);
+    console.log(`[OAuth] Login exitoso: ${result.email}`);
 
     const redirect = new URL(result.redirectUri);
     redirect.searchParams.set("code", authCode);
@@ -182,18 +127,16 @@ const httpServer = http.createServer(async (req, res) => {
     return res.end();
   }
 
-  // 6. Token exchange — Claude intercambia el code por el JWT
+  // 6. Token exchange
   if (url.pathname === "/oauth/token" && method === "POST") {
     const raw = await leerBody(req);
     const params = new URLSearchParams(raw);
     const code = params.get("code") ?? "";
     const codeVerifier = params.get("code_verifier") ?? "";
 
-    console.log(`[OAuth] Token exchange: code=${code ? "present" : "MISSING"}, code_verifier=${codeVerifier ? "present" : "MISSING"}, grant_type=${params.get("grant_type")}`);
-
     const email = await canjearAuthCode(code, codeVerifier);
     if (!email) {
-      console.log(`[OAuth] Token exchange FALLÓ: code inválido o PKCE no coincide`);
+      console.log(`[OAuth] Token exchange FALLÓ`);
       return json(res, 400, { error: "invalid_grant" });
     }
 
@@ -212,8 +155,6 @@ const httpServer = http.createServer(async (req, res) => {
     const token = authHeader.replace("Bearer ", "");
     const usuario = verificarToken(token);
 
-    console.log(`[MCP] Hit endpoint. Path match: /${process.env.PATH_URL}. Auth header: "${authHeader.substring(0, 30)}...". Token válido: ${!!usuario}`);
-
     if (!usuario) {
       res.writeHead(401, {
         "Content-Type": "application/json",
@@ -224,8 +165,23 @@ const httpServer = http.createServer(async (req, res) => {
 
     console.log(`[MCP] Request de: ${usuario}`);
 
-    const server = new McpServer({ name: "mcp-asistencia", version: "1.0.0" });
-    registrarTools(server, usuario);
+    const modulos = await obtenerModulosUsuario(usuario);
+    const server = new McpServer({ name: "mcp-dqd", version: "1.0.0" });
+
+    if (modulos.length === 0) {
+      console.log(`[MCP] Sin permisos: ${usuario}`);
+      server.tool("sin_permisos", "No tenés permisos asignados.", {}, async () => ({
+        content: [{ type: "text", text: MSG_NO_AUTORIZADO }],
+      }));
+    } else {
+      for (const mod of modulos) {
+        if (MODULOS[mod]) {
+          MODULOS[mod](server, usuario);
+          console.log(`[MCP] Módulo cargado: ${mod} para ${usuario}`);
+        }
+      }
+    }
+
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
       await server.connect(transport);
@@ -242,13 +198,11 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  console.log(`[404] No matcheó: ${method} ${url.pathname} (esperado MCP: /${process.env.PATH_URL})`);
   res.writeHead(404);
   res.end();
 });
 
 const PORT = parseInt(process.env.PORT || "3000");
 httpServer.listen(PORT, "0.0.0.0", () => {
-  console.log(`MCP asistencia corriendo en http://0.0.0.0:${PORT}`);
-  console.log(`[DEBUG] PATH_URL="${process.env.PATH_URL}" → ruta esperada: "/${process.env.PATH_URL}"`);
+  console.log(`MCP corriendo en http://0.0.0.0:${PORT}`);
 });
