@@ -23,7 +23,13 @@ export interface AsistenciaConfig {
   schema_description: string;
 }
 
-export function registrarModuloAsistencia(server: McpServer, usuario: string, config: AsistenciaConfig) {
+export function registrarModuloAsistencia(
+  server: McpServer,
+  usuario: string,
+  config: AsistenciaConfig,
+  tienePermiso: boolean
+) {
+  const MSG_SIN_PERMISO = "No tenés permisos para consultar información de asistencia. Si creés que deberías tener acceso, contactá a un administrador.";
   const proyectos = config.proyectos;
   const schemaDescription = `${config.schema_description}
 
@@ -35,19 +41,22 @@ ${Object.entries(proyectos).map(([k, v]) => `  ${k}: ${v.length ? v.join(", ") :
     "listar_proyectos",
     "Lista todos los proyectos de la empresa con sus dispositivos (relojes) asociados.",
     {},
-    async () => ({
-      content: [{ type: "text", text: JSON.stringify(proyectos, null, 2) }],
-    })
+    async () => {
+      if (!tienePermiso) return { content: [{ type: "text", text: MSG_SIN_PERMISO }] };
+      return { content: [{ type: "text", text: JSON.stringify(config.proyectos, null, 2) }] };
+    }
   );
 
   server.tool(
-    "consulta_sql",
+    "asistencia_consulta",
     `Ejecuta una consulta SELECT de solo lectura contra la base de datos de asistencia.
 Usá esta herramienta para responder cualquier pregunta sobre asistencia, presentes, ausentes, empleados, etc.
 
 ${schemaDescription}`,
     { query: z.string().describe("Consulta SQL SELECT a ejecutar. Solo se permiten SELECT.") },
     async ({ query }) => {
+      if (!tienePermiso) return { content: [{ type: "text", text: MSG_SIN_PERMISO }] };
+      
       const trimmed = query.trim();
       if (!/^SELECT\b/i.test(trimmed)) {
         return { content: [{ type: "text", text: "Error: Solo se permiten consultas SELECT." }], isError: true };

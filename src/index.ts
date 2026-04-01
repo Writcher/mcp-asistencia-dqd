@@ -33,15 +33,6 @@ const asistenciaConfig: AsistenciaConfig = {
   schema_description: config.schema_description,
 };
 
-// --- Módulos -----------------------------------------------------------------
-// Para agregar un módulo nuevo: crear src/modules/xxx.ts e importarlo acá.
-
-const MODULOS: Record<string, (server: McpServer, usuario: string) => void> = {
-  asistencia: (server, usuario) => registrarModuloAsistencia(server, usuario, asistenciaConfig),
-};
-
-const MSG_NO_AUTORIZADO = "No tenés permisos asignados para usar estas herramientas. Contactá al administrador si creés que deberías tener acceso.";
-
 // --- Helpers -----------------------------------------------------------------
 
 function leerBody(req: http.IncomingMessage): Promise<string> {
@@ -178,21 +169,13 @@ const httpServer = http.createServer(async (req, res) => {
     console.log(`[MCP] Request de: ${usuario}`);
 
     const modulos = await obtenerModulosUsuario(usuario);
+    console.log(`[MCP] Módulos de ${usuario}: ${modulos.join(", ") || "ninguno"}`);
+
     const server = new McpServer({ name: "mcp-dqd", version: "1.0.0" });
 
-    if (modulos.length === 0) {
-      console.log(`[MCP] Sin permisos: ${usuario}`);
-      server.tool("sin_permisos", "No tenés permisos asignados.", {}, async () => ({
-        content: [{ type: "text", text: MSG_NO_AUTORIZADO }],
-      }));
-    } else {
-      for (const mod of modulos) {
-        if (MODULOS[mod]) {
-          MODULOS[mod](server, usuario);
-          console.log(`[MCP] Módulo cargado: ${mod} para ${usuario}`);
-        }
-      }
-    }
+    // Registrar siempre todos los módulos, pasando si el usuario tiene permiso
+    registrarModuloAsistencia(server, usuario, asistenciaConfig, modulos.includes("asistencia"));
+    // Para agregar un módulo nuevo: registrarModuloXxx(server, usuario, config, modulos.includes("xxx"));
 
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     try {
